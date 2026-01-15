@@ -1,7 +1,13 @@
 package com.example.newsreader
 
+import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -14,67 +20,143 @@ import com.example.newsreader.database.ArticleEntity
 import com.example.newsreader.database.NewsDatabase
 import com.example.newsreader.database.ArticleRepository
 import com.example.newsreader.data.ArticleContentFetcher
+import com.example.newsreader.data.RssFeedManager
 import kotlinx.coroutines.*
 import java.util.*
 
 class NewsReaderAutoService : MediaBrowserServiceCompat() {
 
     private lateinit var mediaSession: MediaSessionCompat
-    private lateinit var stateBuilder: PlaybackStateCompat.Builder
     private var textToSpeech: TextToSpeech? = null
     private var currentArticle: ArticleEntity? = null
-    private var isReading = false
+    private var isPlaying = false
+    private var isPaused = false
 
-    // Coroutine scope cho Service
+    private lateinit var audioManager: AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var hasAudioFocus = false
+
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    
-    // Job hiện tại để có thể cancel
-    private var currentFetchJob: kotlinx.coroutines.Job? = null
-
-    // Repository
+    private var currentFetchJob: Job? = null
     private lateinit var repository: ArticleRepository
-    
-    // Content Fetcher
     private val contentFetcher = ArticleContentFetcher()
+    private val rssFeedManager = RssFeedManager()
 
     companion object {
         const val MEDIA_ROOT_ID = "news_root"
         const val RECENT_NEWS_ID = "recent_news"
+        const val BY_SOURCE_ID = "by_source"
+        const val BY_CATEGORY_ID = "by_category"
+
+        const val SOURCE_PREFIX = "source_"
+        const val SOURCE_VNEXPRESS = "${SOURCE_PREFIX}vnexpress"
+        const val SOURCE_TUOITRE = "${SOURCE_PREFIX}tuoitre"
+        const val SOURCE_THANHNIEN = "${SOURCE_PREFIX}thanhnien"
+        const val SOURCE_DANTRI = "${SOURCE_PREFIX}dantri"
+        const val SOURCE_ZINGNEWS = "${SOURCE_PREFIX}zingnews"
+        const val SOURCE_VIETNAMNET = "${SOURCE_PREFIX}vietnamnet"
+        const val SOURCE_BAOMOI = "${SOURCE_PREFIX}baomoi"
+
+        const val CAT_PREFIX = "cat_"
+        const val CAT_POLITICS = "${CAT_PREFIX}politics"
+        const val CAT_WORLD = "${CAT_PREFIX}world"
+        const val CAT_BUSINESS = "${CAT_PREFIX}business"
+        const val CAT_ENTERTAINMENT = "${CAT_PREFIX}entertainment"
+        const val CAT_SPORTS = "${CAT_PREFIX}sports"
+        const val CAT_TECH = "${CAT_PREFIX}tech"
+        const val CAT_HEALTH = "${CAT_PREFIX}health"
+        const val CAT_EDUCATION = "${CAT_PREFIX}education"
+        const val CAT_LAW = "${CAT_PREFIX}law"
+        const val CAT_CULTURE = "${CAT_PREFIX}culture"
+
+        const val SOURCE_DETAIL_PREFIX = "sourcedetail_"
     }
 
     override fun onCreate() {
         super.onCreate()
 
-        // Khởi tạo Repository
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val database = NewsDatabase.getDatabase(this)
         repository = ArticleRepository(database.articleDao())
 
-        // Khởi tạo MediaSession
+        // BƯỚC 1: TẠO MEDIASESSION
+        setupMediaSession()
+
+        // BƯỚC 2: KHỞI TẠO TTS VỚI AUDIO ATTRIBUTES
+        setupTextToSpeech()
+    }
+
+    private fun setupMediaSession() {
+        // Tạo MediaSession với token
         mediaSession = MediaSessionCompat(this, "NewsReaderService").apply {
+
+            // Set flags để handle transport controls
             setFlags(
                 MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
                         MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
             )
 
-            stateBuilder = PlaybackStateCompat.Builder()
-                .setActions(
-                    PlaybackStateCompat.ACTION_PLAY or
-                            PlaybackStateCompat.ACTION_PAUSE or
-                            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
-                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                            PlaybackStateCompat.ACTION_STOP
-                )
-            setPlaybackState(stateBuilder.build())
-
+            // Set callback để xử lý play/pause/stop
             setCallback(mediaSessionCallback)
-            setSessionToken(sessionToken)
+
+            // Set playback state ban đầu
+            setPlaybackState(
+                PlaybackStateCompat.Builder()
+                    .setActions(
+                        PlaybackStateCompat.ACTION_PLAY or
+                                PlaybackStateCompat.ACTION_PAUSE or
+                                PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                                PlaybackStateCompat.ACTION_STOP or
+                                PlaybackStateCompat.ACTION_PLAY_PAUSE
+                    )
+                    .setState(PlaybackStateCompat.STATE_NONE, 0, 1.0f)
+                    .build()
+            )
+
+            // Set session active
+            isActive = true
         }
 
-        // Khởi tạo Text-to-Speech
+        // Set session token cho Service
+        sessionToken = mediaSession.sessionToken
+
+        android.util.Log.d("MediaSession", "MediaSession created and activated")
+    }
+
+    private fun setupTextToSpeech() {
         textToSpeech = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                textToSpeech?.language = Locale("vi", "VN") // Tiếng Việt
-                setupTTSListener()
+                // Set ngôn ngữ Tiếng Việt
+                val langResult = textToSpeech?.setLanguage(Locale("vi", "VN"))
+
+                when (langResult) {
+                    TextToSpeech.LANG_MISSING_DATA -> {
+                        android.util.Log.e("TTS", "Vietnamese language data missing")
+                    }
+                    TextToSpeech.LANG_NOT_SUPPORTED -> {
+                        android.util.Log.e("TTS", "Vietnamese not supported")
+                    }
+                    else -> {
+                        android.util.Log.d("TTS", "Vietnamese TTS ready")
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                            val audioAttributes = AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .setLegacyStreamType(AudioManager.STREAM_MUSIC)
+                                .build()
+
+                            textToSpeech?.setAudioAttributes(audioAttributes)
+                            android.util.Log.d("TTS", "Audio attributes set to MEDIA stream")
+                        }
+
+                        // Set listener để track progress
+                        setupTTSListener()
+                    }
+                }
+            } else {
+                android.util.Log.e("TTS", "TTS initialization failed: $status")
             }
         }
     }
@@ -82,208 +164,273 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
     private fun setupTTSListener() {
         textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                isReading = true
+                android.util.Log.d("TTS", "Started speaking: $utteranceId")
+                isPlaying = true
+                isPaused = false
+
+                // Update MediaSession state
                 updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
             }
 
             override fun onDone(utteranceId: String?) {
-                isReading = false
+                android.util.Log.d("TTS", "Finished speaking: $utteranceId")
+                isPlaying = false
+
+                // Update MediaSession state
                 updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
             }
 
             override fun onError(utteranceId: String?) {
-                isReading = false
+                android.util.Log.e("TTS", "Error speaking: $utteranceId")
+                isPlaying = false
+
+                // Update MediaSession state
                 updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                android.util.Log.e("TTS", "Error speaking: $utteranceId, code: $errorCode")
+                onError(utteranceId)
             }
         })
     }
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
         override fun onPlay() {
-            currentArticle?.let { article ->
-                readArticle(article)
+            android.util.Log.d("MediaSession", "onPlay() called")
+
+            if (isPaused && textToSpeech?.isSpeaking == false) {
+                // Resume không hoạt động với TTS, cần đọc lại
+                currentArticle?.let { readArticle(it) }
+            } else {
+                currentArticle?.let { readArticle(it) }
             }
         }
 
         override fun onPause() {
-            textToSpeech?.stop()
-            isReading = false
-            updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
+            android.util.Log.d("MediaSession", "onPause() called")
+
+            if (textToSpeech?.isSpeaking == true) {
+                textToSpeech?.stop()
+                isPaused = true
+                isPlaying = false
+                updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
+            }
         }
 
         override fun onStop() {
+            android.util.Log.d("MediaSession", "onStop() called")
+
             textToSpeech?.stop()
-            isReading = false
+            abandonAudioFocus()
             currentArticle = null
+            isPlaying = false
+            isPaused = false
             updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
         }
 
         override fun onSkipToNext() {
+            android.util.Log.d("MediaSession", "onSkipToNext() called")
             textToSpeech?.stop()
             loadNextArticle()
         }
 
         override fun onSkipToPrevious() {
+            android.util.Log.d("MediaSession", "onSkipToPrevious() called")
             textToSpeech?.stop()
             loadPreviousArticle()
         }
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
-            // Dừng bài đang đọc trước
+            android.util.Log.d("MediaSession", "onPlayFromMediaId: $mediaId")
+
             textToSpeech?.stop()
-            
-            // Load và đọc bài mới
+
             mediaId?.let {
-                loadArticleById(it)
+                if (it.startsWith(SOURCE_PREFIX) || it.startsWith(CAT_PREFIX)) {
+                    // Browsable items, ignore
+                } else {
+                    loadArticleById(it)
+                }
+            }
+        }
+    }
+
+    private fun requestAudioFocus(): Boolean {
+        if (hasAudioFocus) return true
+
+        val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { focusChange ->
+                    handleAudioFocusChange(focusChange)
+                }
+                .build()
+
+            audioManager.requestAudioFocus(audioFocusRequest!!)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                { focusChange -> handleAudioFocusChange(focusChange) },
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+
+        hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+
+        android.util.Log.d("AudioFocus", "Request result: $hasAudioFocus")
+
+        return hasAudioFocus
+    }
+
+    private fun abandonAudioFocus() {
+        if (!hasAudioFocus) return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let {
+                audioManager.abandonAudioFocusRequest(it)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+
+        hasAudioFocus = false
+        android.util.Log.d("AudioFocus", "Audio focus abandoned")
+    }
+
+    private fun handleAudioFocusChange(focusChange: Int) {
+        android.util.Log.d("AudioFocus", "Focus change: $focusChange")
+
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                // Có audio focus, có thể phát
+                android.util.Log.d("AudioFocus", "Gained audio focus")
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                // Mất audio focus vĩnh viễn, dừng hẳn
+                android.util.Log.d("AudioFocus", "Lost audio focus")
+                textToSpeech?.stop()
+                abandonAudioFocus()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                // Mất tạm thời (VD: notification), pause
+                android.util.Log.d("AudioFocus", "Lost audio focus temporarily")
+                textToSpeech?.stop()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Có thể giảm âm lượng
+                android.util.Log.d("AudioFocus", "Can duck")
+                // TTS không hỗ trợ duck, nên pause
+                textToSpeech?.stop()
             }
         }
     }
 
     private fun readArticle(article: ArticleEntity) {
         currentArticle = article
-        
-        android.util.Log.d("TTS_Service", "readArticle called for: ${article.title}")
-        android.util.Log.d("TTS_Service", "Has fullContent: ${article.fullContent != null && article.fullContent?.isNotEmpty() == true}")
-        
-        // Cancel fetch job cũ nếu còn đang chạy
+
+        android.util.Log.d("NewsReader", "Reading article: ${article.title}")
+
         currentFetchJob?.cancel()
-        android.util.Log.d("TTS_Service", "Cancelled previous fetch job")
-        
-        // Kiểm tra xem đã có fullContent chưa
+
         if (article.fullContent != null && article.fullContent.isNotEmpty()) {
-            // Đã có full content, đọc luôn
-            android.util.Log.d("TTS_Service", "Reading from cached fullContent: ${article.fullContent.length} chars")
             speakArticle(article, article.fullContent)
         } else {
-            // Chưa có, fetch từ web
-            android.util.Log.d("TTS_Service", "Fetching fullContent from web...")
-            currentFetchJob = serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            currentFetchJob = serviceScope.launch(Dispatchers.IO) {
                 try {
                     val fullContent = contentFetcher.fetchFullContent(article.url)
-                    
-                    if (!coroutineContext.isActive) {
-                        android.util.Log.d("TTS_Service", "Job cancelled, stopping")
-                        return@launch
-                    }
-                    
-                    android.util.Log.d("TTS_Service", "Fetch result: ${fullContent?.length ?: 0} chars")
-                    
+
+                    if (!coroutineContext.isActive) return@launch
+
                     if (fullContent != null && fullContent.isNotEmpty()) {
-                        // Lưu vào database
                         repository.updateFullContent(article.id, fullContent)
-                        android.util.Log.d("TTS_Service", "Saved to DB, now speaking...")
-                        
-                        // Chuyển về main thread để gọi TTS
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+
+                        withContext(Dispatchers.Main) {
                             speakArticle(article, fullContent)
                         }
                     } else {
-                        // Fallback: đọc description
-                        android.util.Log.d("TTS_Service", "Fetch failed, using description fallback")
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        withContext(Dispatchers.Main) {
                             speakArticle(article, article.content)
                         }
                     }
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    android.util.Log.d("TTS_Service", "Fetch cancelled")
-                    throw e // Re-throw để coroutine biết là đã bị cancel
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    android.util.Log.e("TTS_Service", "Error in fetch", e)
-                    e.printStackTrace()
-                    // Fallback: đọc description
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    android.util.Log.e("NewsReader", "Error fetching content", e)
+                    withContext(Dispatchers.Main) {
                         speakArticle(article, article.content)
                     }
                 }
             }
         }
     }
-    
+
     private fun speakArticle(article: ArticleEntity, content: String) {
-        android.util.Log.d("TTS_Service", "speakArticle called")
-        android.util.Log.d("TTS_Service", "Content length: ${content.length}")
-        android.util.Log.d("TTS_Service", "TTS initialized: ${textToSpeech != null}")
-        
+        android.util.Log.d("TTS", "speakArticle() called")
+        android.util.Log.d("TTS", "Article: ${article.title}")
+        android.util.Log.d("TTS", "Content length: ${content.length} chars")
+
         if (textToSpeech == null) {
-            android.util.Log.e("TTS_Service", "TTS is null, cannot speak")
+            android.util.Log.e("TTS", "TTS is null!")
+            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
             return
         }
-        
-        // Kiểm tra TTS đang speaking không
-        val isSpeaking = textToSpeech?.isSpeaking ?: false
-        android.util.Log.d("TTS_Service", "TTS currently speaking: $isSpeaking")
-        
-        // Nếu đang đọc, dừng lại trước
-        if (isSpeaking) {
-            android.util.Log.d("TTS_Service", "Stopping current speech...")
+
+        // BƯỚC 1: Request Audio Focus
+        if (!requestAudioFocus()) {
+            android.util.Log.e("TTS", "Failed to gain audio focus!")
+            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+            return
+        }
+
+        // BƯỚC 2: Stop nếu đang đọc
+        if (textToSpeech?.isSpeaking == true) {
+            android.util.Log.d("TTS", "Stopping current speech")
             textToSpeech?.stop()
         }
-        
-        // Tạo text để đọc (tiêu đề + nội dung)
-        val fullText = "${article.title}. $content"
-        
-        // TTS có giới hạn ~4000 characters, cần chia nhỏ nếu quá dài
-        val maxChunkSize = 3500
-        
-        if (fullText.length <= maxChunkSize) {
-            // Text ngắn, đọc trực tiếp
-            android.util.Log.d("TTS_Service", "Calling TTS.speak() with ${fullText.length} characters")
-            
-            val params = Bundle().apply {
-                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, article.id)
-            }
-            
-            val result = textToSpeech?.speak(fullText, TextToSpeech.QUEUE_FLUSH, params, article.id)
-            android.util.Log.d("TTS_Service", "TTS.speak() returned: $result (SUCCESS=0, ERROR=-1)")
-        } else {
-            // Text quá dài, chia thành nhiều chunk
-            android.util.Log.d("TTS_Service", "Text too long (${fullText.length} chars), splitting into chunks")
-            
-            val chunks = mutableListOf<String>()
-            var currentIndex = 0
-            
-            while (currentIndex < fullText.length) {
-                val endIndex = minOf(currentIndex + maxChunkSize, fullText.length)
-                
-                // Tìm dấu câu gần nhất để chia tự nhiên hơn
-                var splitIndex = endIndex
-                if (endIndex < fullText.length) {
-                    val nearbyPunctuation = fullText.substring(endIndex - 100, endIndex)
-                        .lastIndexOfAny(charArrayOf('.', '!', '?', '\n'))
-                    if (nearbyPunctuation != -1) {
-                        splitIndex = endIndex - 100 + nearbyPunctuation + 1
-                    }
-                }
-                
-                chunks.add(fullText.substring(currentIndex, splitIndex).trim())
-                currentIndex = splitIndex
-            }
-            
-            android.util.Log.d("TTS_Service", "Split into ${chunks.size} chunks")
-            
-            // Đọc chunk đầu tiên
-            chunks.forEachIndexed { index, chunk ->
-                val params = Bundle().apply {
-                    putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "${article.id}_chunk_$index")
-                }
-                
-                val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-                val result = textToSpeech?.speak(chunk, queueMode, params, "${article.id}_chunk_$index")
-                android.util.Log.d("TTS_Service", "Chunk $index: ${chunk.length} chars, result=$result")
-            }
-        }
-        
-        isReading = true
-        
-        // Update playback state to PLAYING
-        updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
 
-        // Cập nhật metadata với content đang được đọc
-        updateMediaMetadata(article, content)
-        
-        // Đánh dấu bài đã đọc
-        serviceScope.launch {
-            repository.markAsRead(article.id)
+        // BƯỚC 3: Chuẩn bị text
+        val fullText = "${article.title}. $content"
+        android.util.Log.d("TTS", "Full text length: ${fullText.length} chars")
+
+        // BƯỚC 4: Tạo params
+        val params = Bundle().apply {
+            putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, article.id)
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+        }
+
+        // BƯỚC 5: Gọi TTS speak
+        val result = textToSpeech?.speak(
+            fullText,
+            TextToSpeech.QUEUE_FLUSH,
+            params,
+            article.id
+        )
+
+        android.util.Log.d("TTS", "speak() returned: $result (SUCCESS=0, ERROR=-1)")
+
+        if (result == TextToSpeech.SUCCESS) {
+            // BƯỚC 6: Update MediaSession
+            isPlaying = true
+            isPaused = false
+            updateMediaMetadata(article, content)
+            updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+
+            // BƯỚC 7: Đánh dấu đã đọc
+            serviceScope.launch {
+                repository.markAsRead(article.id)
+            }
+        } else {
+            android.util.Log.e("TTS", "speak() failed!")
+            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
         }
     }
 
@@ -292,17 +439,19 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
             .putString(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_TITLE, article.title)
             .putString(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_ARTIST, article.source)
             .putString(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_DISPLAY_DESCRIPTION, article.summary)
-            .putLong(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_DURATION,
-                estimateReadingTime(content))
+            .putLong(
+                android.support.v4.media.MediaMetadataCompat.METADATA_KEY_DURATION,
+                estimateReadingTime(content)
+            )
             .build()
 
         mediaSession.setMetadata(metadata)
+        android.util.Log.d("MediaSession", "Metadata updated")
     }
 
     private fun estimateReadingTime(text: String): Long {
-        // Ước tính thời gian đọc (khoảng 150 từ/phút)
         val wordCount = text.split("\\s+".toRegex()).size
-        return (wordCount * 60000L / 150)
+        return (wordCount * 60000L / 150) // 150 words per minute
     }
 
     private fun updatePlaybackState(state: Int) {
@@ -312,12 +461,23 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
                         PlaybackStateCompat.ACTION_PAUSE or
                         PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
                         PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                        PlaybackStateCompat.ACTION_STOP
+                        PlaybackStateCompat.ACTION_STOP or
+                        PlaybackStateCompat.ACTION_PLAY_PAUSE
             )
             .setState(state, 0, 1.0f)
             .build()
 
         mediaSession.setPlaybackState(playbackState)
+
+        val stateStr = when(state) {
+            PlaybackStateCompat.STATE_PLAYING -> "PLAYING"
+            PlaybackStateCompat.STATE_PAUSED -> "PAUSED"
+            PlaybackStateCompat.STATE_STOPPED -> "STOPPED"
+            PlaybackStateCompat.STATE_ERROR -> "ERROR"
+            PlaybackStateCompat.STATE_BUFFERING -> "BUFFERING"
+            else -> "UNKNOWN($state)"
+        }
+        android.util.Log.d("MediaSession", "State updated to: $stateStr")
     }
 
     private fun loadArticleById(articleId: String) {
@@ -349,6 +509,7 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
         clientUid: Int,
         rootHints: Bundle?
     ): BrowserRoot {
+        android.util.Log.d("MediaBrowser", "onGetRoot called from: $clientPackageName")
         return BrowserRoot(MEDIA_ROOT_ID, null)
     }
 
@@ -356,44 +517,175 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
         parentId: String,
         result: Result<MutableList<MediaBrowserCompat.MediaItem>>
     ) {
+        android.util.Log.d("MediaBrowser", "onLoadChildren: $parentId")
         val mediaItems = mutableListOf<MediaBrowserCompat.MediaItem>()
 
         when (parentId) {
             MEDIA_ROOT_ID -> {
-                // Danh sách các danh mục
-                mediaItems.add(createBrowsableMediaItem(
-                    RECENT_NEWS_ID,
-                    "Tin mới nhất",
-                    "Các tin tức mới nhất"
-                ))
+                mediaItems.add(createBrowsableMediaItem(BY_SOURCE_ID, "Trang báo", "Chọn theo tờ báo"))
                 result.sendResult(mediaItems)
             }
+
             RECENT_NEWS_ID -> {
-                // Load danh sách bài báo từ database
+                result.detach()
                 serviceScope.launch {
-                    val articles = getRecentArticles()
+                    try {
+                        val articles = repository.getAllArticlesSync()
+                        articles.forEach { article ->
+                            mediaItems.add(createPlayableMediaItem(article))
+                        }
+                        result.sendResult(mediaItems)
+                    } catch (e: Exception) {
+                        result.sendResult(mediaItems)
+                    }
+                }
+            }
+
+            BY_SOURCE_ID -> {
+                mediaItems.add(createBrowsableMediaItem(SOURCE_VNEXPRESS, "VnExpress", "Báo VnExpress"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_TUOITRE, "Tuổi Trẻ", "Báo Tuổi Trẻ"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_THANHNIEN, "Thanh Niên", "Báo Thanh Niên"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_DANTRI, "Dân Trí", "Báo Dân Trí"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_ZINGNEWS, "Zing News", "Zing News"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_VIETNAMNET, "VietnamNet", "Báo VietnamNet"))
+                mediaItems.add(createBrowsableMediaItem(SOURCE_BAOMOI, "Báo Mới", "Báo Mới"))
+                result.sendResult(mediaItems)
+            }
+
+            BY_CATEGORY_ID -> {
+                mediaItems.add(createBrowsableMediaItem(CAT_POLITICS, "Thời sự", "Tin thời sự, chính trị"))
+                mediaItems.add(createBrowsableMediaItem(CAT_WORLD, "Thế giới", "Tin quốc tế"))
+                mediaItems.add(createBrowsableMediaItem(CAT_BUSINESS, "Kinh doanh", "Tin kinh tế, doanh nghiệp"))
+                mediaItems.add(createBrowsableMediaItem(CAT_ENTERTAINMENT, "Giải trí", "Tin giải trí, showbiz"))
+                mediaItems.add(createBrowsableMediaItem(CAT_SPORTS, "Thể thao", "Tin thể thao"))
+                mediaItems.add(createBrowsableMediaItem(CAT_TECH, "Công nghệ", "Tin công nghệ, số hóa"))
+                mediaItems.add(createBrowsableMediaItem(CAT_HEALTH, "Sức khỏe", "Tin sức khỏe, y tế"))
+                mediaItems.add(createBrowsableMediaItem(CAT_EDUCATION, "Giáo dục", "Tin giáo dục"))
+                mediaItems.add(createBrowsableMediaItem(CAT_LAW, "Pháp luật", "Tin pháp luật"))
+                mediaItems.add(createBrowsableMediaItem(CAT_CULTURE, "Văn hóa", "Tin văn hóa, du lịch"))
+                result.sendResult(mediaItems)
+            }
+
+            SOURCE_VNEXPRESS -> showSourceCategories("VnExpress", result, mediaItems)
+            SOURCE_TUOITRE -> showSourceCategories("Tuổi Trẻ", result, mediaItems)
+            SOURCE_THANHNIEN -> showSourceCategories("Thanh Niên", result, mediaItems)
+            SOURCE_DANTRI -> showSourceCategories("Dân Trí", result, mediaItems)
+            SOURCE_ZINGNEWS -> showSourceCategories("Zing News", result, mediaItems)
+            SOURCE_VIETNAMNET -> showSourceCategories("VietnamNet", result, mediaItems)
+            SOURCE_BAOMOI -> showSourceCategories("Báo Mới", result, mediaItems)
+
+            else -> {
+                when {
+                    parentId.startsWith(SOURCE_DETAIL_PREFIX) -> {
+                        handleSourceDetailRequest(parentId, result, mediaItems)
+                    }
+                    parentId.startsWith(CAT_PREFIX) -> {
+                        handleCategoryRequest(parentId, result, mediaItems)
+                    }
+                    else -> {
+                        result.sendResult(mediaItems)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showSourceCategories(
+        sourceName: String,
+        result: Result<MutableList<MediaBrowserCompat.MediaItem>>,
+        mediaItems: MutableList<MediaBrowserCompat.MediaItem>
+    ) {
+        val categories = RssFeedManager.NEWS_SOURCES[sourceName] ?: emptyMap()
+
+        categories.forEach { (categoryName, _) ->
+            val id = "${SOURCE_DETAIL_PREFIX}${sourceName}__$categoryName"
+            mediaItems.add(createBrowsableMediaItem(id, categoryName, "Tin $categoryName từ $sourceName"))
+        }
+
+        result.sendResult(mediaItems)
+    }
+
+    private fun handleSourceDetailRequest(
+        parentId: String,
+        result: Result<MutableList<MediaBrowserCompat.MediaItem>>,
+        mediaItems: MutableList<MediaBrowserCompat.MediaItem>
+    ) {
+        result.detach()
+
+        serviceScope.launch {
+            try {
+                val parts = parentId.removePrefix(SOURCE_DETAIL_PREFIX).split("__")
+                if (parts.size == 2) {
+                    val sourceName = parts[0]
+                    val categoryName = parts[1]
+
+                    val articles = rssFeedManager.fetchFeedsByCategory(sourceName, categoryName)
+
+                    if (articles.isNotEmpty()) {
+                        repository.insertArticles(articles)
+                    }
+
                     articles.forEach { article ->
                         mediaItems.add(createPlayableMediaItem(article))
                     }
-                    result.sendResult(mediaItems)
                 }
 
-                // Detach result để không block
-                result.detach()
-            }
-            else -> {
+                result.sendResult(mediaItems)
+            } catch (e: Exception) {
+                android.util.Log.e("NewsReader", "Error loading source detail", e)
                 result.sendResult(mediaItems)
             }
         }
     }
 
-    private suspend fun getRecentArticles(): List<ArticleEntity> = withContext(Dispatchers.IO) {
-        // Lấy từ Flow và convert thành List
-        try {
-            // Giả lập - trong thực tế cần collect từ Flow
-            emptyList()
-        } catch (e: Exception) {
-            emptyList()
+    private fun handleCategoryRequest(
+        parentId: String,
+        result: Result<MutableList<MediaBrowserCompat.MediaItem>>,
+        mediaItems: MutableList<MediaBrowserCompat.MediaItem>
+    ) {
+        result.detach()
+
+        serviceScope.launch {
+            try {
+                val categoryNameInRss = when(parentId) {
+                    CAT_POLITICS -> "Thời sự"
+                    CAT_WORLD -> "Thế giới"
+                    CAT_BUSINESS -> "Kinh doanh"
+                    CAT_ENTERTAINMENT -> "Giải trí"
+                    CAT_SPORTS -> "Thể thao"
+                    CAT_TECH -> "Công nghệ"
+                    CAT_HEALTH -> "Sức khỏe"
+                    CAT_EDUCATION -> "Giáo dục"
+                    CAT_LAW -> "Pháp luật"
+                    CAT_CULTURE -> "Văn hóa"
+                    else -> null
+                }
+
+                if (categoryNameInRss != null) {
+                    val allArticles = mutableListOf<ArticleEntity>()
+
+                    listOf("VnExpress", "Tuổi Trẻ", "Thanh Niên", "Dân Trí", "Zing News", "VietnamNet").forEach { source ->
+                        try {
+                            val articles = rssFeedManager.fetchFeedsByCategory(source, categoryNameInRss)
+                            allArticles.addAll(articles)
+                        } catch (e: Exception) {
+                            // Skip
+                        }
+                    }
+
+                    if (allArticles.isNotEmpty()) {
+                        repository.insertArticles(allArticles)
+                    }
+
+                    allArticles.forEach { article ->
+                        mediaItems.add(createPlayableMediaItem(article))
+                    }
+                }
+
+                result.sendResult(mediaItems)
+            } catch (e: Exception) {
+                result.sendResult(mediaItems)
+            }
         }
     }
 
@@ -420,7 +712,7 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
             .setTitle(article.title)
             .setSubtitle(article.source)
             .setDescription(article.summary)
-            .setIconUri(Uri.parse(article.imageUrl))
+            .setIconUri(if (article.imageUrl.isNotEmpty()) Uri.parse(article.imageUrl) else null)
             .build()
 
         return MediaBrowserCompat.MediaItem(
@@ -431,8 +723,17 @@ class NewsReaderAutoService : MediaBrowserServiceCompat() {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        android.util.Log.d("Service", "onDestroy() called")
+
+        textToSpeech?.stop()
         textToSpeech?.shutdown()
+
+        abandonAudioFocus()
+
+        mediaSession.isActive = false
         mediaSession.release()
-        serviceScope.cancel() // Cancel coroutine scope
+
+        serviceScope.cancel()
     }
 }

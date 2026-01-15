@@ -24,6 +24,9 @@ interface ArticleDao {
     @Query("SELECT * FROM articles ORDER BY publishedDate DESC")
     fun getAllArticles(): Flow<List<ArticleEntity>>
 
+    @Query("SELECT * FROM articles ORDER BY publishedDate DESC LIMIT 50")
+    suspend fun getAllArticlesList(): List<ArticleEntity>
+
     @Query("SELECT * FROM articles WHERE id = :articleId LIMIT 1")
     suspend fun getArticleById(articleId: String): ArticleEntity?
 
@@ -38,7 +41,7 @@ interface ArticleDao {
 
     @Query("UPDATE articles SET isRead = :isRead WHERE id = :articleId")
     suspend fun updateReadStatus(articleId: String, isRead: Boolean)
-    
+
     @Query("UPDATE articles SET fullContent = :fullContent WHERE id = :articleId")
     suspend fun updateFullContent(articleId: String, fullContent: String)
 
@@ -61,7 +64,7 @@ abstract class NewsDatabase : RoomDatabase() {
                     NewsDatabase::class.java,
                     "news_database"
                 )
-                    .fallbackToDestructiveMigration() // Xóa và tạo lại DB khi thay đổi schema
+                    .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance
                 instance
@@ -71,8 +74,11 @@ abstract class NewsDatabase : RoomDatabase() {
 }
 
 class ArticleRepository(private val articleDao: ArticleDao) {
-    // Flow để observe danh sách bài báo
     val allArticles: Flow<List<ArticleEntity>> = articleDao.getAllArticles()
+
+    suspend fun getAllArticlesSync(): List<ArticleEntity> {
+        return articleDao.getAllArticlesList()
+    }
 
     suspend fun getArticleById(articleId: String): ArticleEntity? {
         return articleDao.getArticleById(articleId)
@@ -99,7 +105,7 @@ class ArticleRepository(private val articleDao: ArticleDao) {
     suspend fun markAsRead(articleId: String) {
         articleDao.updateReadStatus(articleId, true)
     }
-    
+
     suspend fun updateFullContent(articleId: String, fullContent: String) {
         articleDao.updateFullContent(articleId, fullContent)
     }

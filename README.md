@@ -366,3 +366,16 @@ MIT License - Tự do sử dụng và chỉnh sửa
 
 **Lưu ý:** Tuân thủ điều khoản sử dụng của các trang báo khi sử dụng RSS feeds.
 "# newsreaderapp" 
+
+# Mở Command Prompt
+cd C:\Users\Admin\AppData\Local\Android\Sdk\platform-tools
+
+# Kiểm tra device
+adb devices
+
+# Forward port
+adb forward tcp:5277 tcp:5277
+
+# Chạy DHU
+cd C:\Users\Admin\AppData\Local\Android\Sdk\extras\google\auto
+desktop-head-unit.exe
